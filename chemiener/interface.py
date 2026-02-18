@@ -98,7 +98,8 @@ class ChemNER:
 
             sentences, masks, refs = self.collate(batch_strings_tokenized)
 
-            predictions = self.model(input_ids = sentences.to(device), attention_mask = masks.to(device))[0].argmax(dim = 2).to('cpu')
+            with torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
+                predictions = self.model(input_ids = sentences.to(device), attention_mask = masks.to(device))[0].argmax(dim = 2).to('cpu')
 
             sentences_list = list(sentences)
 
