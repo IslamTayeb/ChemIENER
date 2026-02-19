@@ -1,8 +1,6 @@
-import os
 import argparse
 from typing import List
 import torch
-import numpy as np
 
 from .model import build_model
 
@@ -61,7 +59,83 @@ class ChemNER:
         model.eval()
 
         return model
-    
+
+    def tokenize_all(self, strings: List):
+        """CPU: batch tokenize all strings upfront."""
+        return [(self.dataset.tokenizer(s, truncation=True, max_length=512),
+                 torch.Tensor([-1]), torch.Tensor([-1])) for s in strings]
+
+    def infer_gpu(self, tokenized_batches: List, batch_size=8):
+        """
+        GPU-only: BERT forward on pre-tokenized input.
+
+        Args:
+            tokenized_batches: Output from tokenize_all()
+            batch_size: Batch size for inference
+
+        Returns:
+            List of (sentences_tensor, predictions_tensor, batch_tokenized) tuples
+        """
+        device = self.device
+        all_results = []
+
+        for idx in range(0, len(tokenized_batches), batch_size):
+            batch = tokenized_batches[idx:idx+batch_size]
+            sentences, masks, refs = self.collate(batch)
+
+            with torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
+                predictions = self.model(
+                    input_ids=sentences.to(device),
+                    attention_mask=masks.to(device)
+                )[0].argmax(dim=2).to('cpu')
+
+            all_results.append((sentences, predictions, batch))
+
+        return all_results
+
+    def decode_cpu(self, raw_results):
+        """
+        CPU: decode model outputs to NER labels.
+
+        Args:
+            raw_results: Output from infer_gpu()
+
+        Returns:
+            List of label lists (same format as predict_strings output)
+        """
+        def prepare_output(char_span, prediction):
+            toreturn = []
+            i = 0
+            while i < len(char_span):
+                if prediction[i][0] == 'B':
+                    toreturn.append((prediction[i][2:], [char_span[i].start, char_span[i].end]))
+                elif len(toreturn) > 0 and prediction[i][2:] == toreturn[-1][0]:
+                    toreturn[-1] = (toreturn[-1][0], [toreturn[-1][1][0], char_span[i].end])
+                i += 1
+            return toreturn
+
+        output = []
+        for sentences, predictions, batch_tokenized in raw_results:
+            sentences_list = list(sentences)
+            predictions_list = list(predictions)
+
+            char_spans = []
+            for j, sentence in enumerate(sentences_list):
+                to_add = [batch_tokenized[j][0].token_to_chars(i) for i, word in enumerate(sentence)
+                         if len(self.dataset.tokenizer.decode(int(word.item()), skip_special_tokens=True)) > 0]
+                char_spans.append(to_add)
+
+            class_predictions = [
+                [self.index_to_class[int(pred.item())] for (pred, word) in zip(sentence_p, sentence_w)
+                 if len(self.dataset.tokenizer.decode(int(word.item()), skip_special_tokens=True)) > 0]
+                for (sentence_p, sentence_w) in zip(predictions_list, sentences_list)
+            ]
+
+            output += [prepare_output(char_span, prediction)
+                      for char_span, prediction in zip(char_spans, class_predictions)]
+
+        return output
+
     def predict_strings(self, strings: List, batch_size = 8):
         device = self.device
 
@@ -83,7 +157,7 @@ class ChemNER:
                 elif len(toreturn) > 0 and prediction[i][2:] == toreturn[-1][0]:
                     toreturn[-1] = (toreturn[-1][0], [toreturn[-1][1][0], char_span[i].end])
 
-                    
+
 
                 i += 1
 
@@ -114,9 +188,9 @@ class ChemNER:
             class_predictions = [[self.index_to_class[int(pred.item())] for (pred, word) in zip(sentence_p, sentence_w) if len(self.dataset.tokenizer.decode(int(word.item()), skip_special_tokens = True)) > 0] for (sentence_p, sentence_w) in zip(predictions_list, sentences_list)]
 
 
-            
+
             output+=[prepare_output(char_span, prediction) for char_span, prediction in zip(char_spans, class_predictions)]
-        
+
         return output
 
 
