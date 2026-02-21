@@ -1,4 +1,5 @@
 import argparse
+import time
 from typing import List
 import torch
 
@@ -62,8 +63,11 @@ class ChemNER:
 
     def tokenize_all(self, strings: List):
         """CPU: batch tokenize all strings upfront."""
-        return [(self.dataset.tokenizer(s, truncation=True, max_length=512),
-                 torch.Tensor([-1]), torch.Tensor([-1])) for s in strings]
+        t0 = time.time()
+        result = [(self.dataset.tokenizer(s, truncation=True, max_length=512),
+                    torch.Tensor([-1]), torch.Tensor([-1])) for s in strings]
+        self._last_tokenize_timing = {'total': time.time() - t0, 'num_strings': len(strings)}
+        return result
 
     def infer_gpu(self, tokenized_batches: List, batch_size=8):
         """
@@ -78,19 +82,38 @@ class ChemNER:
         """
         device = self.device
         all_results = []
+        t_total = time.time()
+        timing = {'forward': 0, 'collate': 0, 'sync_wait': 0, 'num_batches': 0, 'num_strings': len(tokenized_batches)}
 
         for idx in range(0, len(tokenized_batches), batch_size):
+            timing['num_batches'] += 1
             batch = tokenized_batches[idx:idx+batch_size]
-            sentences, masks, refs = self.collate(batch)
 
+            t0 = time.time()
+            sentences, masks, refs = self.collate(batch)
+            timing['collate'] += time.time() - t0
+
+            t0 = time.time()
+            sentences_gpu = sentences.to(device)
+            masks_gpu = masks.to(device)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing['sync_wait'] += time.time() - t0
+
+            t0 = time.time()
             with torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
                 predictions = self.model(
-                    input_ids=sentences.to(device),
-                    attention_mask=masks.to(device)
+                    input_ids=sentences_gpu,
+                    attention_mask=masks_gpu
                 )[0].argmax(dim=2).to('cpu')
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing['forward'] += time.time() - t0
 
             all_results.append((sentences, predictions, batch))
 
+        timing['total'] = time.time() - t_total
+        self._last_infer_timing = timing
         return all_results
 
     def decode_cpu(self, raw_results):
@@ -103,6 +126,8 @@ class ChemNER:
         Returns:
             List of label lists (same format as predict_strings output)
         """
+        t0 = time.time()
+
         def prepare_output(char_span, prediction):
             toreturn = []
             i = 0
@@ -134,64 +159,79 @@ class ChemNER:
             output += [prepare_output(char_span, prediction)
                       for char_span, prediction in zip(char_spans, class_predictions)]
 
+        self._last_decode_timing = {'total': time.time() - t0}
         return output
 
-    def predict_strings(self, strings: List, batch_size = 8):
+    def predict_strings(self, strings: List, batch_size=8):
         device = self.device
-
-        predictions = []
+        t_total = time.time()
+        timing = {'tokenize': 0, 'sync_wait': 0, 'forward': 0, 'decode': 0,
+                  'num_strings': len(strings), 'num_batches': 0}
 
         def prepare_output(char_span, prediction):
             toreturn = []
-
-
             i = 0
-
             while i < len(char_span):
                 if prediction[i][0] == 'B':
                     toreturn.append((prediction[i][2:], [char_span[i].start, char_span[i].end]))
-
-
-
-
                 elif len(toreturn) > 0 and prediction[i][2:] == toreturn[-1][0]:
                     toreturn[-1] = (toreturn[-1][0], [toreturn[-1][1][0], char_span[i].end])
-
-
-
                 i += 1
-
-
             return toreturn
 
         output = []
         for idx in range(0, len(strings), batch_size):
+            timing['num_batches'] += 1
             batch_strings = strings[idx:idx+batch_size]
-            batch_strings_tokenized = [(self.dataset.tokenizer(s, truncation = True, max_length = 512),  torch.Tensor([-1]), torch.Tensor([-1]) ) for s in batch_strings]
 
-
+            t0 = time.time()
+            batch_strings_tokenized = [(self.dataset.tokenizer(s, truncation=True, max_length=512),
+                                        torch.Tensor([-1]), torch.Tensor([-1])) for s in batch_strings]
             sentences, masks, refs = self.collate(batch_strings_tokenized)
+            timing['tokenize'] += time.time() - t0
 
+            t0 = time.time()
+            sentences_gpu = sentences.to(device)
+            masks_gpu = masks.to(device)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing['sync_wait'] += time.time() - t0
+
+            t0 = time.time()
             with torch.cuda.amp.autocast(dtype=torch.float16, enabled=(device.type == 'cuda')):
-                predictions = self.model(input_ids = sentences.to(device), attention_mask = masks.to(device))[0].argmax(dim = 2).to('cpu')
+                predictions = self.model(input_ids=sentences_gpu,
+                                         attention_mask=masks_gpu)[0].argmax(dim=2).to('cpu')
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            timing['forward'] += time.time() - t0
 
+            t0 = time.time()
             sentences_list = list(sentences)
-
             predictions_list = list(predictions)
-
 
             char_spans = []
             for j, sentence in enumerate(sentences_list):
-                to_add = [batch_strings_tokenized[j][0].token_to_chars(i) for i, word in enumerate(sentence) if len(self.dataset.tokenizer.decode(int(word.item()), skip_special_tokens = True)) > 0 ]
+                to_add = [batch_strings_tokenized[j][0].token_to_chars(i) for i, word in enumerate(sentence)
+                          if len(self.dataset.tokenizer.decode(int(word.item()), skip_special_tokens=True)) > 0]
                 char_spans.append(to_add)
 
-            class_predictions = [[self.index_to_class[int(pred.item())] for (pred, word) in zip(sentence_p, sentence_w) if len(self.dataset.tokenizer.decode(int(word.item()), skip_special_tokens = True)) > 0] for (sentence_p, sentence_w) in zip(predictions_list, sentences_list)]
+            class_predictions = [
+                [self.index_to_class[int(pred.item())] for (pred, word) in zip(sentence_p, sentence_w)
+                 if len(self.dataset.tokenizer.decode(int(word.item()), skip_special_tokens=True)) > 0]
+                for (sentence_p, sentence_w) in zip(predictions_list, sentences_list)
+            ]
 
+            output += [prepare_output(char_span, prediction)
+                       for char_span, prediction in zip(char_spans, class_predictions)]
+            timing['decode'] += time.time() - t0
 
-
-            output+=[prepare_output(char_span, prediction) for char_span, prediction in zip(char_spans, class_predictions)]
-
+        timing['total'] = time.time() - t_total
+        self._last_timing = timing
         return output
+
+    def get_last_timing(self):
+        """Get timing data from the last predict_strings call."""
+        return getattr(self, '_last_timing', None)
 
 
 
